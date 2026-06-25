@@ -20,6 +20,7 @@ The app opens in your browser at `http://localhost:8501`.
 
 - **Experimental spectrum**: a CSV with at least a wavenumber column and an intensity column (e.g. `m/z 140.0 -ln(depl)`).
 - **DFT spectra**: multiple CSV files named `CID_<cid>_<name>_scaled_<factor>.csv`. Upload all isomers you want to compare.
+- **Raw experimental spectrum (optional)**: an unsmoothed experimental CSV. If provided, the app runs the Savitzky-Golay smoothing sensitivity analysis on it (re-fitting at each smoothing level and reporting assignment stability). If omitted, that step is skipped.
 
 ### 3. Adjust parameters
 
@@ -34,6 +35,7 @@ Use the sidebar to set:
 - Number of CV blocks (default: 10)
 - Polynomial baseline order (default: 1)
 - Peak detection thresholds
+- Savitzky-Golay smoothing pairs (`window,order; ...`) — used only when a raw experimental CSV is uploaded
 
 ### 4. Run and download
 

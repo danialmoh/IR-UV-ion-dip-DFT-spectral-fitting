@@ -77,15 +77,21 @@ def load_dft_from_uploads(uploaded_files, exp_wn, scale_factor, regex_pattern, w
         if not m:
             continue
         cid, mol_name = m.group(1), m.group(2).replace("_", " ")
-        # Read CSV, skip possible comment lines
-        df = pd.read_csv(f, comment="#")
-        # If the file has no header, the first row becomes the header by default.
-        # Try to infer numeric columns.
-        if df[df.columns[0]].dtype.kind not in "iuf":
-            # No header: re-read with header=None
-            f.seek(0)
-            df = pd.read_csv(f, comment="#", header=None)
-            df.columns = ["Wavenumber", "Fundamentals", "Overtones", "Combinations", "Total"]
+        # Read CSV with comment lines (e.g. "# Wavenumber,...") stripped, no header.
+        f.seek(0)
+        df = pd.read_csv(f, comment="#", header=None)
+        # Decide whether the first remaining row is a real text header or data.
+        first_row_numeric = pd.to_numeric(df.iloc[0], errors="coerce").notna().all()
+        if first_row_numeric:
+            # No text header: assign standard DFT column names when shape matches.
+            if df.shape[1] == 5:
+                df.columns = ["Wavenumber", "Fundamentals", "Overtones", "Combinations", "Total"]
+            else:
+                df.columns = [f"col{i}" for i in range(df.shape[1])]
+        else:
+            # First row is a genuine header: promote it and convert data to numeric.
+            df.columns = df.iloc[0].astype(str).str.strip()
+            df = df.iloc[1:].reset_index(drop=True).apply(pd.to_numeric, errors="coerce")
 
         if wn_col not in df.columns:
             # fallback to first numeric column
@@ -242,6 +248,64 @@ def run_bootstrap(dft_matrix, selected, exp_wn, exp_norm, n_boot, block_len, pol
     return all_weights
 
 
+def parse_sg_params(s):
+    pairs = []
+    for chunk in s.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = chunk.split(",")
+        if len(parts) == 2:
+            try:
+                pairs.append((int(parts[0]), int(parts[1])))
+            except ValueError:
+                continue
+    return pairs
+
+
+def load_raw_experimental(uploaded_file, wn_col, int_col, wn_range):
+    df = pd.read_csv(uploaded_file)
+    if wn_col not in df.columns:
+        raise ValueError(f"Wavenumber column '{wn_col}' not found. Columns: {list(df.columns)}")
+    if int_col not in df.columns:
+        raise ValueError(f"Intensity column '{int_col}' not found. Columns: {list(df.columns)}")
+    wn = df[wn_col].values.astype(float)
+    intens = df[int_col].values.astype(float)
+    mask = (wn >= wn_range[0]) & (wn <= wn_range[1])
+    return wn[mask], intens[mask]
+
+
+def run_sg_sensitivity(raw_wn, raw_int, dft_matrix_raw, molecules, sg_params, n_cv_blocks, poly_order):
+    results = []
+    for win, order in sg_params:
+        w = min(win, len(raw_int))
+        if w % 2 == 0:
+            w -= 1
+        if w <= order:
+            continue
+        sm = savgol_filter(raw_int, window_length=w, polyorder=order)
+        sm = np.clip(sm, 0, None)
+        mx = sm.max()
+        sg_norm = sm / mx if mx > 0 else sm
+        ss_tot_sg = float(np.sum((sg_norm - sg_norm.mean()) ** 2))
+        hist = forward_stepwise(dft_matrix_raw, raw_wn, sg_norm, max_k=8, poly_order=poly_order)
+        if not hist:
+            continue
+        cvs = [blocked_cv(dft_matrix_raw, h[0], raw_wn, sg_norm, n_cv_blocks, poly_order) for h in hist]
+        bk = int(np.argmin(cvs) + 1)
+        sel = hist[bk - 1][0]
+        dc, _, rss, _ = fit_lsq(dft_matrix_raw[sel], raw_wn, sg_norm, poly_order)
+        r2 = 1 - rss / ss_tot_sg if ss_tot_sg > 0 else 0.0
+        top_i = sel[int(np.argmax(dc))]
+        top_w = dc.max() / dc.sum() if dc.sum() > 0 else 0.0
+        results.append({
+            "window": win, "order": order, "k": bk, "r2": r2,
+            "cv": cvs[bk - 1], "top_cid": molecules[top_i]["cid"], "top_w": top_w,
+            "sel_cids": [molecules[s]["cid"] for s in sel],
+        })
+    return results
+
+
 # ================================================================
 # PLOTTING HELPERS
 # ================================================================
@@ -337,6 +401,18 @@ def make_sensitivity_plot(sens_results):
     for x, y, cid in zip(scales, r2s, top_cids):
         fig.add_annotation(x=x, y=y, text=f"k={next(r['k'] for r in sens_results if r['scale']==x)}<br>top {cid}", showarrow=False, yshift=15, font_size=9)
     fig.update_layout(title="Sensitivity to DFT Scaling Factor", xaxis_title="Scaling factor", yaxis_title="R²", height=500)
+    return fig
+
+
+def make_sg_plot(sg_results):
+    labels = [f"({r['window']},{r['order']})" for r in sg_results]
+    r2s = [r["r2"] for r in sg_results]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=labels, y=r2s, mode="lines+markers", name="R²"))
+    for lbl, r in zip(labels, sg_results):
+        fig.add_annotation(x=lbl, y=r["r2"], text=f"k={r['k']}<br>top {r['top_cid']}", showarrow=False, yshift=15, font_size=9)
+    fig.update_layout(title="Sensitivity to Experimental Smoothing (Savitzky-Golay)",
+                      xaxis_title="(window, polyorder)", yaxis_title="R²", height=500)
     return fig
 
 
@@ -474,6 +550,7 @@ def main():
     st.sidebar.header("Upload Data")
     exp_file = st.sidebar.file_uploader("Experimental CSV", type="csv")
     dft_files = st.sidebar.file_uploader("DFT spectra CSVs (multiple)", type="csv", accept_multiple_files=True)
+    exp_raw_file = st.sidebar.file_uploader("Raw experimental CSV (optional, for smoothing sensitivity)", type="csv")
 
     st.sidebar.header("Analysis Settings")
     wn_min = st.sidebar.number_input("Wavenumber min (cm⁻¹)", value=DEFAULT_CONFIG["wn_min"], step=10.0)
@@ -491,6 +568,13 @@ def main():
     peak_height = st.sidebar.number_input("Peak height", value=DEFAULT_CONFIG["peak_height"], step=0.05)
     peak_distance = st.sidebar.number_input("Peak distance (points)", value=DEFAULT_CONFIG["peak_distance"], step=1)
     peak_prominence = st.sidebar.number_input("Peak prominence", value=DEFAULT_CONFIG["peak_prominence"], step=0.01)
+
+    st.sidebar.header("Smoothing Sensitivity")
+    sg_params_str = st.sidebar.text_input(
+        "Savitzky-Golay (window,order; ...)",
+        value="; ".join(f"{w},{o}" for w, o in DEFAULT_CONFIG["sg_params"]),
+        help="Only used if a raw experimental CSV is uploaded.",
+    )
 
     st.sidebar.header("File Naming")
     dft_regex = st.sidebar.text_input("DFT filename regex", value=DEFAULT_CONFIG["dft_regex"])
@@ -513,6 +597,7 @@ def main():
         "peak_height": peak_height,
         "peak_distance": int(peak_distance),
         "peak_prominence": peak_prominence,
+        "sg_params": parse_sg_params(sg_params_str),
         "dft_regex": dft_regex,
         "dft_wn_col": dft_wn_col,
         "dft_int_col": dft_int_col,
@@ -539,6 +624,21 @@ def main():
         return
 
     st.markdown(f"**{len(dft_files)}** DFT file(s) uploaded.")
+
+    # Optional raw experimental file column selection (for smoothing sensitivity)
+    raw_wn_col = raw_int_col = None
+    if exp_raw_file is not None:
+        try:
+            raw_preview = pd.read_csv(exp_raw_file, nrows=3)
+            exp_raw_file.seek(0)
+            st.subheader("Raw experimental file preview (smoothing sensitivity)")
+            st.write(raw_preview)
+            raw_wn_col = st.selectbox("Raw wavenumber column", raw_preview.columns.tolist(), key="raw_wn")
+            raw_int_col = st.selectbox("Raw intensity column", raw_preview.columns.tolist(),
+                                       index=1 if len(raw_preview.columns) > 1 else 0, key="raw_int")
+        except Exception as e:
+            st.warning(f"Could not read raw experimental file (smoothing sensitivity will be skipped): {e}")
+            exp_raw_file = None
 
     if not run:
         st.info("Click **Run Analysis** in the sidebar when ready.")
@@ -664,6 +764,24 @@ def main():
         sens_results.append({"scale": sf, "k": bk, "r2": r2_s, "cv": cv_s[bk - 1],
                              "top_cid": molecules[top_i]["cid"], "top_w": top_w, "sel": sel_s})
 
+    # Experimental smoothing sensitivity (Savitzky-Golay) — only if a raw file was uploaded
+    sg_results = []
+    sg_error = None
+    if exp_raw_file is not None and config["sg_params"]:
+        progress.progress(0.95, text="Smoothing sensitivity...")
+        try:
+            raw_wn, raw_int = load_raw_experimental(exp_raw_file, raw_wn_col, raw_int_col, wn_range)
+            _, dft_matrix_raw = load_dft_from_uploads(
+                dft_files, raw_wn, config["scaling_factor"], config["dft_regex"],
+                config["dft_wn_col"], config["dft_int_col"]
+            )
+            sg_results = run_sg_sensitivity(
+                raw_wn, raw_int, dft_matrix_raw, molecules,
+                config["sg_params"], config["n_cv_blocks"], config["poly_order"]
+            )
+        except Exception as e:
+            sg_error = str(e)
+
     progress.progress(1.0, text="Done")
 
     # ---- RESULTS UI ----
@@ -751,6 +869,39 @@ def main():
             st.dataframe(sens_df, use_container_width=True)
         else:
             st.markdown("No sensitivity results produced.")
+
+    with st.expander("Experimental Smoothing Sensitivity (Savitzky-Golay)"):
+        if sg_error:
+            st.warning(f"Smoothing sensitivity failed: {sg_error}")
+        elif exp_raw_file is None:
+            st.markdown("Upload a **raw experimental CSV** in the sidebar to run smoothing sensitivity.")
+        elif sg_results:
+            st.plotly_chart(make_sg_plot(sg_results), use_container_width=True)
+            sg_df = pd.DataFrame({
+                "Window": [r["window"] for r in sg_results],
+                "Polyorder": [r["order"] for r in sg_results],
+                "Best k": [r["k"] for r in sg_results],
+                "R²": [r["r2"] for r in sg_results],
+                "Top CID": [r["top_cid"] for r in sg_results],
+                "Top Wt": [r["top_w"] for r in sg_results],
+                "Selected CIDs": [", ".join(r["sel_cids"]) for r in sg_results],
+            })
+            st.dataframe(sg_df, use_container_width=True)
+            sg_top_cids = [r["top_cid"] for r in sg_results]
+            if len(set(sg_top_cids)) == 1:
+                st.success(f"Top assignment stable across all smoothings: CID {sg_top_cids[0]}")
+            else:
+                st.warning(f"Top assignment varies with smoothing: {sg_top_cids}")
+            all_sel = [cid for r in sg_results for cid in r["sel_cids"]]
+            freq = Counter(all_sel)
+            n_runs = len(sg_results)
+            st.markdown(f"**CID selection frequency across {n_runs} smoothings:**")
+            st.dataframe(pd.DataFrame(
+                [{"CID": cid, "Selected": f"{cnt}/{n_runs}", "Fraction": f"{cnt/n_runs:.0%}"}
+                 for cid, cnt in freq.most_common()]
+            ), use_container_width=True)
+        else:
+            st.markdown("No smoothing sensitivity results produced (check SG parameters).")
 
     # Summary CSV
     summary_rows = []

@@ -1,0 +1,48 @@
+# Data files (not uploaded to GitHub)
+*.csv
+*.out
+*.log
+*.sdf
+*.mol
+*.xyz
+*.txt
+!requirements.txt
+
+# Generated outputs
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+b3lyp_def2-tzvp/
+b3lyp_n07d/
+IR_results/
+plots/
+PubChem_search_images-2/
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+*.egg
+build/
+dist/
+.env
+.venv
+venv/
+env/
+
+# Streamlit
+.streamlit/

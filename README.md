@@ -35,8 +35,8 @@ These files are excluded via `.gitignore` so that the repository stays lightweig
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/<your-username>/<your-repo-name>.git
-cd <your-repo-name>
+git clone https://github.com/<your-username>/IR-UV-ion-dip-DFT-spectral-fitting.git
+cd IR-UV-ion-dip-DFT-spectral-fitting
 ```
 
 ### 2. Install dependencies
